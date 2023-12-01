@@ -1,0 +1,5 @@
+output token: [10 10 10 10 ]
+golden token: [10 10 10 10 ]
+pass test token 0
+finish testing projection
+digirec retnet recurrent:      1 calls;   0.113 msecs total time
