@@ -21,6 +21,8 @@ input_ids = torch.LongTensor([[1,2,1,2]]).to(device)
 
 
 
+
+
 # parallel inference
 # model.chunkwise_recurrent = False
 # parallel_state, _ = model(input_ids, features_only=True)
