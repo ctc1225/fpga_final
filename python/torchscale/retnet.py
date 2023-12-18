@@ -52,6 +52,9 @@ class RMSNorm(nn.Module):
             self.register_parameter('weight', None)
 
     def _norm(self, x):
+        # print(f'x: {x}')
+        # print(f'scale: {torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)}')
+        # print(f'output: {x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)}')
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
@@ -69,6 +72,7 @@ class RetNetRelPos(nn.Module):
 
         angle = 1.0 / (10000**torch.linspace(0, 1, config.decoder_embed_dim // num_heads // 2))
         angle = angle.unsqueeze(-1).repeat(1, 2).flatten()
+        # print(f'angle: {angle}')
         if config.use_lm_decay:
             # NOTE: alternative way described in the paper
             s = torch.log(torch.tensor(1 / 32))
@@ -83,10 +87,12 @@ class RetNetRelPos(nn.Module):
     def forward(self, slen, activate_recurrent=False, chunkwise_recurrent=False):
         # print("slen: ", slen)
         if activate_recurrent:
+            # print(f'slen: {slen}')
+            # print(f'factor: {self.angle * (slen - 1)}')
             sin = torch.sin(self.angle * (slen - 1))
             cos = torch.cos(self.angle * (slen - 1))
             retention_rel_pos = ((sin, cos), self.decay.exp())
-            print("sin shape: ", sin.shape)
+            # print("sin shape: ", sin.shape)
         elif chunkwise_recurrent:
             index = torch.arange(slen).to(self.decay)
             sin = torch.sin(index[:, None] * self.angle[None, :])
@@ -268,19 +274,21 @@ class MultiScaleRetention(nn.Module):
         k = self.k_proj(x) # (bsz, # of token, hidden dim)
         v = self.v_proj(x) # (bsz, # of token, value dim)
         g = self.g_proj(x) # (bsz, # of token, value dim)
-        print("q, k shape: ", q.shape)
-        print("v, g shape: ", v.shape)
+        # print("q, k shape: ", q.shape)
+        # print("q: ", q)
+        # print("v, g shape: ", v.shape)
 
         # split head
         k *= self.scaling
         q = q.view(bsz, tgt_len, self.num_heads, self.key_dim).transpose(1, 2)
         k = k.view(bsz, tgt_len, self.num_heads, self.key_dim).transpose(1, 2)
-        print("q, k shape after head split: ", q.shape) # (bsz, # of heads, # of token, key dim)
+        # print("q, k shape after head split: ", q.shape) # (bsz, # of heads, # of token, key dim)
 
         # rotary position encoding
         qr = theta_shift(q, sin, cos) # shape does not change
         kr = theta_shift(k, sin, cos) # shape does not change
-        print("q, k shape after rotation: ", qr.shape)
+        # print("qr: ", qr)
+        # print("q, k shape after rotation: ", qr.shape)
 
 
         if incremental_state is not None:
@@ -290,12 +298,12 @@ class MultiScaleRetention(nn.Module):
         else:
             output = self.parallel_forward(qr, kr, v, inner_mask)
         
-        print("output size after recurrent forward: ", output.shape)
+        # print("output size after recurrent forward: ", output.shape)
         output = self.group_norm(output).reshape(bsz, tgt_len, self.head_dim * self.num_heads)
-        print("output size after GN: ", output.shape)
+        # print("output size after GN: ", output.shape)
 
         output = self.gate_fn(g) * output
-        print("output size after gate fn: ", output.shape)
+        # print("output size after gate fn: ", output.shape)
 
         output = self.out_proj(output)
         print("output size after output projection: ", output.shape)
@@ -476,14 +484,14 @@ class RetNetDecoderLayer(nn.Module):
         residual = x
         if self.normalize_before:
             x = self.retention_layer_norm(x)
-        print("x size before multi-scale retention: ", x.shape)
+        # print("x size before multi-scale retention: ", x.shape)
         x = self.retention(
             x,
             incremental_state=incremental_state,
             rel_pos=retention_rel_pos,
             chunkwise_recurrent=chunkwise_recurrent,
         )
-        print("x size after multi-scale retention: ", x.shape)
+        # print("x size after multi-scale retention: ", x.shape)
         x = self.dropout_module(x)
 
         if self.drop_path is not None:
@@ -637,6 +645,7 @@ class RetNetModel(nn.Module):
         is_first_step = self.is_first_step(incremental_state)
 
         print("embedded x size: ", x.shape)
+        print("embedded x: ", x)
 
         if self.chunkwise_recurrent and prev_output_tokens.size(1) % self.recurrent_chunk_size != 0:
             padding_len = self.recurrent_chunk_size - prev_output_tokens.size(

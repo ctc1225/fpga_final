@@ -2,3 +2,5 @@
 *.pth
 *.pyc
 *.log
+ret_weight/
+mha_weight/

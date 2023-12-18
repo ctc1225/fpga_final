@@ -1,12 +1,26 @@
-from retnet import RetNetModel, RetNetRelPos, RMSNorm, get_activation_fn, theta_shift, rotate_every_two
-from config import RetNetConfig
+from python.torchscale.retnet import RetNetModel, RetNetRelPos, RMSNorm, get_activation_fn
+from python.torchscale.config import RetNetConfig
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.quantization.quantize_fx import prepare_fx, convert_fx
 from torch.ao.quantization import QConfigMapping, default_histogram_observer, default_weight_observer
 
+import numpy as np
 import torch
 import copy
+
+torch.manual_seed(1999)
+
+def rotate_every_two(x):
+    x1 = x[:, :, :, ::2]
+    x2 = x[:, :, :, 1::2]
+    x = torch.stack((-x2, x1), dim=-1)
+    return x.flatten(-2)  # in einsum notation: rearrange(x, '... d j -> ... (d j)')\
+
+def theta_shift(x, sin, cos):
+    # print("x: ", x)
+    # print("sin: ", sin)
+    return (x * cos) + (rotate_every_two(x) * sin)
 
 class MultiScaleRetention(nn.Module):
 
@@ -25,7 +39,8 @@ class MultiScaleRetention(nn.Module):
         self.num_heads = num_heads 
         self.head_dim = self.value_dim // num_heads
         self.key_dim = self.embed_dim // num_heads
-        self.scaling = self.key_dim**-0.5
+        # self.scaling = self.key_dim**-0.5
+        self.scaling = 1
 
         self.gate_fn = get_activation_fn(activation=str(gate_fn))
 
@@ -65,7 +80,10 @@ class MultiScaleRetention(nn.Module):
         v = v.view(bsz, self.num_heads, self.head_dim, 1) # (bsz, # of head, head dim, 1)
         # print("v shape before matmul: ", v.shape)
         # kr shape: (bsz, # of head, # of token, key dim)
+        # print("kr: ", kr)
+        # print("v: ", v)
         kv = kr * v # equivalent to matmul(v, kr)
+        # print("kv: ", kv)
         # kv shape: (bsz, # of head, head dim, key dim)
         # print("kv shape: ", kv.shape)
 
@@ -81,18 +99,25 @@ class MultiScaleRetention(nn.Module):
         prev_kv = incremental_state["prev_key_value"]
         prev_scale = incremental_state["scale"]
         scale = prev_scale * decay + 1
-        kv = prev_kv * (prev_scale.sqrt() * decay / scale.sqrt()).view(
-            self.num_heads, 1, 1) + kv / scale.sqrt().view(self.num_heads, 1, 1)
-        print("kv: " , kv)
-        # kv = prev_kv * decay.view(self.num_heads, 1, 1) + kv
+        # kv = prev_kv * (prev_scale.sqrt() * decay / scale.sqrt()).view(
+        #     self.num_heads, 1, 1) + kv / scale.sqrt().view(self.num_heads, 1, 1)
+        # print(f"decay: {decay}")
+        # print(f"kv shape: ", prev_kv.shape)
+        # print(f'prev state: {prev_kv}')
+        kv = prev_kv * decay.view(self.num_heads, 1, 1) + kv
+        # print("kv: " , kv)
 
-        # incremental_state["prev_key_value"] = kv
-        # incremental_state["scale"] = scale
+        incremental_state["prev_key_value"] = kv
+        incremental_state["scale"] = scale
+        # print(f"state: {kv}")
         
+        # print(f'qr: {qr}')
         # print("qr shape: ", qr.shape)
         # print("kv shape: ", kv.shape)
         # print("(qr*kv) shape before sum: ", (qr*kv).shape)
         output = torch.sum(qr * kv, dim=3) # equivalent to matmul(kv, qrT)
+        # print(f"output dim: {output.shape}")
+        # print(f"output: {output}")
         # print("(qr*kv) shape after sum: ", output.shape)
         return output
 
@@ -148,28 +173,37 @@ class MultiScaleRetention(nn.Module):
         return output
 
     def forward(self, x, rel_pos, chunkwise_recurrent=False, incremental_state=None):
+        # print(f"previous state: {incremental_state}")
         bsz, tgt_len, _ = x.size()
-        print("x dim: ", x.size())
+        # print("x dim: ", x.size())
         (sin, cos), inner_mask = rel_pos
 
         # projection with weight matrix
+        # print("x: ", x)
+        # print("self q weight: ", self.q_proj.weight)
+        # print("sin: ", sin)
+        # print("cos: ", cos)
         q = self.q_proj(x) # (bsz, # of token, hidden dim)
         k = self.k_proj(x) # (bsz, # of token, hidden dim)
         v = self.v_proj(x) # (bsz, # of token, value dim)
         g = self.g_proj(x) # (bsz, # of token, value dim)
-        print("q, k shape: ", q.shape)
-        print("v, g shape: ", v.shape)
+        # print(f'k: {k}')
+        # print("q, k shape: ", q.shape)
+        # print("v, g shape: ", v.shape)
 
         # split head
         k *= self.scaling
         q = q.view(bsz, tgt_len, self.num_heads, self.key_dim).transpose(1, 2)
         k = k.view(bsz, tgt_len, self.num_heads, self.key_dim).transpose(1, 2)
-        print("q, k shape after head split: ", q.shape) # (bsz, # of heads, # of token, key dim)
+        # print("q, k shape after head split: ", q.shape) # (bsz, # of heads, # of token, key dim)
 
         # rotary position encoding
+        # print("k: ", k)
         qr = theta_shift(q, sin, cos) # shape does not change
         kr = theta_shift(k, sin, cos) # shape does not change
-        print("q, k shape after rotation: ", qr.shape)
+        # print("kr: ", kr)
+        # print(f'v: {v}')
+        # print("q, k shape after rotation: ", qr.shape)
 
 
         if incremental_state is not None:
@@ -179,64 +213,126 @@ class MultiScaleRetention(nn.Module):
         else:
             output = self.parallel_forward(qr, kr, v, inner_mask)
         
+        # print("output size after recurrent forward: ", output.shape)
+        # print(f'output before gn: {output}')
         output = self.group_norm(output).reshape(bsz, tgt_len, self.head_dim * self.num_heads)
+        # print(f'output after gn: {output}')
+        # print("output size after GN: ", output.shape)
 
-        output = self.gate_fn(g) * output
+        # output = self.gate_fn(g) * output
+        # print("output size after gate fn: ", output.shape)
 
+        # print(f'output b4 proj: {output}')
         output = self.out_proj(output)
+        # print(f'output after proj: {output}')
+        # print("output size after output projection: ", output.shape)
 
         return output
 
+def write_weight(file_path, weight):
+    weight = weight.detach().numpy()
+    (r, c) = weight.shape
+    with open(f'{file_path}.txt', "w") as file: # for hardware use
+        for i in range(r):
+            file.write("{ ")
+            for j in range(c):
+                file.write(str(weight[i][j]))
+                # np.savetxt(file, weight[i][j], fmt='%f', newline="")
+                if j != c-1: file.write(", ")
+            # np.savetxt(file, weight[i].flatten(), fmt='%f', newline=", ")
+            file.write(" },\n") if i != r-1 else file.write("}\n")
+    np.savetxt(file_path, weight) # for load use
 
-config = RetNetConfig(decoder_layers=2, decoder_embed_dim=256, decoder_retention_heads=8, decoder_ffn_embed_dim=512, recurrent_chunk_size=2)
-embed_tokens = torch.nn.Embedding(100, config.decoder_embed_dim)
-model = RetNetModel(config, embed_tokens=embed_tokens)
+def write_vector(file_path, vec):
+    l = vec.shape[0]
+    with open(f'{file_path}.txt', "w") as file: # for hardware use
+        for i in range(l):
+            file.write("%.5f" % (float(vec[i])))
+            if i != l-1: file.write(', ')
+            # np.savetxt(file, vec[i][j], fmt='%f', newline="")
+        file.write("\n")
+    np.savetxt(file_path, vec) # for load use
 
-# model = torch.ao.quantization.quantize_dynamic(
-#     model,
-#     {torch.nn.Linear},
-#     dtype=torch.qint8
-# )
-
-# device = 'cuda'
-device = 'cpu'
-
-model = model.to(device)
-# print(model)
-
-input_ids = torch.Tensor([[1]]).int()
-# y = model(input_ids)
-
-input = torch.randn(1, 1, 256)
-retention = MultiScaleRetention(config, 256, 1280, 8)
+def write_token(file_path, tokens):
+    l = tokens.shape[0]
+    with open(f'{file_path}.txt', "w") as file:
+        for i in range(l):
+            file.write("%.5f" % (float(tokens[i])))
+            file.write('\n')
+    np.savetxt(file_path, tokens)
+H     = 2
+D_e   = 128
+D_v   = 128
+D_k   = int(D_e/H)
+D_h   = int(D_v/H)
+NUM_OF_TOKEN = 2
+gamma = torch.tensor(1.0)
+config = RetNetConfig(
+    decoder_layers=1, 
+    decoder_embed_dim=D_e, 
+    decoder_value_embed_dim=D_v,
+    decoder_retention_heads=H, 
+    decoder_ffn_embed_dim=512,
+)
+retention = MultiScaleRetention(config, D_e, D_v, H)
+retention.eval()
 retnet_rel_pos = RetNetRelPos(config)
-retention_rel_pos = retnet_rel_pos(0,
-                                    True,
-                                    chunkwise_recurrent=False)
+input_token = torch.tensor([
+    [[0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8]]
+])
+input_token = torch.rand(1, 1, D_e)
+q_weight_file_path = "./ret_weight/q_weight"
+k_weight_file_path = "./ret_weight/k_weight"
+v_weight_file_path = "./ret_weight/v_weight"
+out_weight_file_path = "./ret_weight/out_weight"
+angle_file_path = "./ret_weight/angle"
+input_token_file_path = './ret_weight/tokens'
+write_weight(q_weight_file_path, torch.transpose(retention.q_proj.weight, 0, 1))
+write_weight(k_weight_file_path, torch.transpose(retention.k_proj.weight, 0, 1))
+write_weight(v_weight_file_path, torch.transpose(retention.v_proj.weight, 0, 1))
+write_weight(out_weight_file_path, torch.transpose(retention.out_proj.weight, 0, 1))
+write_vector(angle_file_path, 1.0 / (10000**torch.linspace(0, 1, D_e // H // 2)))
+write_token(input_token_file_path, input_token[0][0])
+
+
+
+# print(input.shape)
 incremental_state = {}
 
-incremental_state["prev_key_value"] = torch.randn(1, 8, 160, 32)
-incremental_state["scale"] = torch.tensor(1.0)
-# y = retention(input, retention_rel_pos, incremental_state=incremental_state)
+# incremental_state["prev_key_value"] = torch.randn(1, H, D_h, D_k)
+incremental_state["prev_key_value"] = torch.zeros(1, H, D_h, D_k)
+# print(f"prev state: {incremental_state['prev_key_value']}")
+incremental_state["scale"] = gamma
+for i in range(NUM_OF_TOKEN):
+    print(f'forwarding {i} token')
+    retention_rel_pos = retnet_rel_pos(i, True, chunkwise_recurrent=False)
+    ((sin, cos), mask) = retention_rel_pos
+    # print(f'sin: {sin}')
+    # print(f'cos: {cos}')
+    # print(f'mask: {mask}')
+    
+    y = retention(input_token, retention_rel_pos, incremental_state=incremental_state)
+    input_token = y
+    print(f"Pytorch output: {y}")
 # print(y.shape)
 
 # Pytorch FX
-retention.eval()
-qconfig = torch.ao.quantization.QConfig(
-    activation=default_histogram_observer,
-    weight=default_weight_observer.with_args(dtype=torch.qint8))
+# retention.eval()
+# qconfig = torch.ao.quantization.QConfig(
+#     activation=default_histogram_observer,
+#     weight=default_weight_observer.with_args(dtype=torch.qint8))
 
-qconfig_mapping = QConfigMapping().set_global(qconfig)
-model_to_quantize = copy.deepcopy(retention)
-prepared_model = prepare_fx(model_to_quantize, qconfig_mapping, example_inputs=input_ids)
+# qconfig_mapping = QConfigMapping().set_global(qconfig)
+# model_to_quantize = copy.deepcopy(retention)
+# prepared_model = prepare_fx(model_to_quantize, qconfig_mapping, example_inputs=input_ids)
 
 # quantized_model = convert_fx(prepared_model)
-# print(quantized_model)
-# quantized_model.eval()
+# # print(quantized_model)
 
 # # print(quantized_model.q_proj.weight().int_repr())
 # print(quantized_model.q_proj.scale)
-# print(quantized_model.q_proj.zero_point)
+# quantized_model.q_proj.scale = 16
+# print(quantized_model.q_proj.scale)
 # print(quantized_model.q_proj.weight().int_repr())
 # # quantized_model.eval()
 
